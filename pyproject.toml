@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "medcred"
+version = "0.1.0"
+description = "A beautiful, production-grade credential management CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "typer[all]>=0.12",
+    "cryptography>=42",
+    "pydantic>=2",
+    "pyperclip>=1.8",
+]
+
+[project.scripts]
+medcred = "medcred.cli:app"
+
+[project.optional-dependencies]
+puma = [
+    "python-tss-sdk>=1.2",
+]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/medcred"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff]
+line-length = 100
