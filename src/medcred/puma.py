@@ -4,13 +4,25 @@ Provides a thin client for fetching secrets from an on-prem Secret Server
 instance via the python-tss-sdk, and a set of CLI sub-commands that let you
 pull those secrets directly into the medcred vault.
 
-Environment variables
----------------------
-PUMA_URL        Base URL of the Secret Server (e.g. https://puma.corp.example.com)
-PUMA_USER       Application account username
-PUMA_DOMAIN     Windows / AD domain for domain auth (omit for basic auth)
-PUMA_PASSWORD   Application account password
-REQUESTS_CA_BUNDLE   Path to CA bundle .pem for self-signed TLS certs (optional)
+Credential resolution order
+---------------------------
+Puma service-account credentials are resolved in this order at runtime:
+
+1. git credential store  — the primary source.  Backed by your OS keychain
+   (macOS Keychain, Windows Credential Manager, Linux libsecret).  Store once:
+
+       medcred puma store-credentials --url https://puma.corp.example.com --user svc_acct
+
+2. Environment variables — override / one-off use:
+       PUMA_URL        Base URL of the Secret Server
+       PUMA_USER       Application account username
+       PUMA_DOMAIN     Windows / AD domain (omit for basic auth)
+       PUMA_PASSWORD   Application account password
+
+   REQUESTS_CA_BUNDLE   Path to CA bundle .pem for self-signed TLS certs (optional)
+
+Once authenticated, Puma is queried live for the secret — so rotating passwords
+are always fetched fresh at call time, never cached locally.
 
 Usage (CLI)
 -----------
@@ -18,12 +30,15 @@ Usage (CLI)
     medcred puma fetch --path "\\Folder\\Name"   # fetch by folder path
     medcred puma pull 1234                   # fetch and store in local vault
     medcred puma env 1234                    # print as KEY=VALUE exports
+    medcred puma store-credentials           # save Puma creds in OS keychain via git
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 from typing import Annotated, Optional
+from urllib.parse import urlparse
 
 import typer
 from rich.console import Console
@@ -40,6 +55,74 @@ puma_app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
+
+
+# ---------------------------------------------------------------------------
+# git credential helpers
+# ---------------------------------------------------------------------------
+
+
+def _git_credential_get(url: str, username: str | None = None) -> tuple[str | None, str | None]:
+    """Query the git credential store for (username, password) for *url*.
+
+    Uses ``git credential fill`` which delegates to whichever credential helper
+    is configured (OS keychain on macOS/Windows, libsecret on Linux, etc.).
+    Returns ``(None, None)`` if git is unavailable or no match is found.
+    """
+    parsed = urlparse(url)
+    lines = [f"protocol={parsed.scheme}", f"host={parsed.netloc}"]
+    if username:
+        lines.append(f"username={username}")
+    lines.append("")  # git requires a trailing blank line
+
+    try:
+        result = subprocess.run(
+            ["git", "credential", "fill"],
+            input="\n".join(lines),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None, None
+
+    if result.returncode != 0:
+        return None, None
+
+    got_user: str | None = None
+    got_pass: str | None = None
+    for line in result.stdout.splitlines():
+        if line.startswith("username="):
+            got_user = line[len("username="):]
+        elif line.startswith("password="):
+            got_pass = line[len("password="):]
+
+    return got_user, got_pass
+
+
+def _git_credential_approve(url: str, username: str, password: str) -> bool:
+    """Store *username* / *password* for *url* in the git credential store.
+
+    Returns ``True`` on success, ``False`` if git is unavailable.
+    """
+    parsed = urlparse(url)
+    credential_input = (
+        f"protocol={parsed.scheme}\n"
+        f"host={parsed.netloc}\n"
+        f"username={username}\n"
+        f"password={password}\n\n"
+    )
+    try:
+        result = subprocess.run(
+            ["git", "credential", "approve"],
+            input=credential_input,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -77,8 +160,30 @@ class PumaClient:
         if token:
             authorizer = AccessTokenAuthorizer(token)
         else:
-            user = _require_env("PUMA_USER")
-            password = _require_env("PUMA_PASSWORD")
+            # Primary: git credential store (works in scripts, notebooks, CI).
+            # Override: explicit env vars (useful for one-off overrides).
+            gc_user, gc_pass = _git_credential_get(base_url)
+            user = os.environ.get("PUMA_USER") or gc_user
+            password = os.environ.get("PUMA_PASSWORD") or gc_pass
+
+            if gc_user and gc_pass and not os.environ.get("PUMA_PASSWORD"):
+                err.print("[dim]Puma credentials loaded from git credential store.[/dim]")
+
+            if not user:
+                err.print(
+                    "[bold red]No Puma credentials found.[/bold red]\n"
+                    "Run: [bold]medcred puma store-credentials --url PUMA_URL --user USERNAME[/bold]\n"
+                    "Or set [bold]PUMA_USER[/bold] and [bold]PUMA_PASSWORD[/bold] env vars."
+                )
+                raise typer.Exit(1)
+            if not password:
+                err.print(
+                    "[bold red]No Puma password found.[/bold red]\n"
+                    "Run: [bold]medcred puma store-credentials --url PUMA_URL --user USERNAME[/bold]\n"
+                    "Or set [bold]PUMA_PASSWORD[/bold] env var."
+                )
+                raise typer.Exit(1)
+
             domain = os.environ.get("PUMA_DOMAIN")
             if domain:
                 authorizer = DomainPasswordGrantAuthorizer(
@@ -306,3 +411,50 @@ def env(
         # Use printf-style quoting — wrap in single quotes, escape embedded ones
         safe = value.replace("'", "'\\''")
         typer.echo(f"export {var}='{safe}'")
+
+
+@puma_app.command("store-credentials")
+def store_credentials(
+    url: Annotated[Optional[str], typer.Option("--url", "-u", help="Puma server base URL.")] = None,
+    user: Annotated[Optional[str], typer.Option("--user", help="Service account username.")] = None,
+) -> None:
+    """Save Puma service-account credentials in the git credential store.
+
+    Credentials are stored in your OS keychain via the configured git
+    credential helper and are retrieved automatically at runtime — no env
+    vars needed in scripts or notebooks.
+
+    \\b
+    Example:
+        medcred puma store-credentials \\
+            --url https://puma.corp.example.com \\
+            --user svc_medcred
+    """
+    from rich.prompt import Prompt
+
+    puma_url = url or os.environ.get("PUMA_URL")
+    if not puma_url:
+        err.print(
+            "[bold red]Provide --url or set PUMA_URL.[/bold red]"
+        )
+        raise typer.Exit(1)
+
+    puma_user = user or os.environ.get("PUMA_USER")
+    if not puma_user:
+        puma_user = Prompt.ask("Puma username", console=console)
+
+    puma_password = Prompt.ask("Puma password", password=True, console=console)
+
+    ok = _git_credential_approve(puma_url, puma_user, puma_password)
+    if ok:
+        console.print(
+            f"[bold green]Credentials for [bold]{puma_url}[/bold] stored in git credential store.[/bold green]\n"
+            "[dim]medcred puma commands will now use them automatically.[/dim]"
+        )
+    else:
+        err.print(
+            "[bold red]Failed to store credentials.[/bold red]\n"
+            "Ensure git is installed and a credential helper is configured.\n"
+            "Quick setup:  [bold]git config --global credential.helper store[/bold]"
+        )
+        raise typer.Exit(1)

@@ -102,6 +102,9 @@ def _require_vault() -> VaultStore:
 
 
 def _ask_password(prompt: str = "Master password") -> str:
+    env_pw = os.environ.get("MEDCRED_MASTER_PASSWORD")
+    if env_pw:
+        return env_pw
     return Prompt.ask(prompt, password=True, console=console)
 
 
